@@ -36,8 +36,8 @@ The system allows you to teach a reinforcement learning agent novel behaviors, e
 
 ```bash
 # Clone the repository
-git clone https://github.com/anthropics/rl-teacher.git
-cd rl-teacher
+git clone https://github.com/VimalMollyn/DeepRLFromHumanPref.git
+cd DeepRLFromHumanPref
 
 # Create virtual environment and install with uv
 uv venv
