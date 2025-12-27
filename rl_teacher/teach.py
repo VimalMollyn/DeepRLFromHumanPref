@@ -1,43 +1,51 @@
+"""Main training script for RL-Teacher.
+
+Deep Reinforcement Learning from Human Preferences (Christiano et al., 2017)
+Updated for 2025 with PyTorch and Stable-Baselines3.
+"""
 import os
 import os.path as osp
 import random
 from collections import deque
 from time import time, sleep
 
+import gymnasium as gym
 import numpy as np
-import tensorflow as tf
-from keras import backend as K
-from parallel_trpo.train import train_parallel_trpo
-from pposgd_mpi.run_mujoco import train_pposgd_mpi
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from stable_baselines3 import PPO
+from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
 
 from rl_teacher.comparison_collectors import SyntheticComparisonCollector, HumanComparisonCollector
-from rl_teacher.envs import get_timesteps_per_episode
-from rl_teacher.envs import make_with_torque_removed
+from rl_teacher.envs import get_timesteps_per_episode, make_with_torque_removed
 from rl_teacher.label_schedules import LabelAnnealer, ConstantLabelSchedule
 from rl_teacher.nn import FullyConnectedMLP
-from rl_teacher.segment_sampling import sample_segment_from_path
-from rl_teacher.segment_sampling import segments_from_rand_rollout
+from rl_teacher.segment_sampling import sample_segment_from_path, segments_from_rand_rollout
 from rl_teacher.summaries import AgentLogger, make_summary_writer
 from rl_teacher.utils import slugify, corrcoef
 from rl_teacher.video import SegmentVideoRecorder
 
 CLIP_LENGTH = 1.5
 
-class TraditionalRLRewardPredictor(object):
+
+class TraditionalRLRewardPredictor:
     """Predictor that always returns the true reward provided by the environment."""
 
     def __init__(self, summary_writer):
         self.agent_logger = AgentLogger(summary_writer)
 
     def predict_reward(self, path):
-        self.agent_logger.log_episode(path)  # <-- This may cause problems in future versions of Teacher.
+        self.agent_logger.log_episode(path)
         return path["original_rewards"]
 
     def path_callback(self, path):
         pass
 
-class ComparisonRewardPredictor():
-    """Predictor that trains a model to predict how much reward is contained in a trajectory segment"""
+
+class ComparisonRewardPredictor:
+    """Predictor that trains a model to predict how much reward is contained in a trajectory segment."""
 
     def __init__(self, env, summary_writer, comparison_collector, agent_logger, label_schedule):
         self.summary_writer = summary_writer
@@ -45,160 +53,153 @@ class ComparisonRewardPredictor():
         self.comparison_collector = comparison_collector
         self.label_schedule = label_schedule
 
-        # Set up some bookkeeping
-        self.recent_segments = deque(maxlen=200)  # Keep a queue of recently seen segments to pull new comparisons from
+        # Set up bookkeeping
+        self.recent_segments = deque(maxlen=200)
         self._frames_per_segment = CLIP_LENGTH * env.fps
         self._steps_since_last_training = 0
-        self._n_timesteps_per_predictor_training = 1e2  # How often should we train our predictor?
+        self._n_timesteps_per_predictor_training = 1e2
         self._elapsed_predictor_training_iters = 0
 
-        # Build and initialize our predictor model
-        config = tf.ConfigProto(
-            device_count={'GPU': 0}
-        )
-        self.sess = tf.InteractiveSession(config=config)
+        # Set up device
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        # Build the model
         self.obs_shape = env.observation_space.shape
         self.discrete_action_space = not hasattr(env.action_space, "shape")
         self.act_shape = (env.action_space.n,) if self.discrete_action_space else env.action_space.shape
-        self.graph = self._build_model()
-        self.sess.run(tf.global_variables_initializer())
 
-    def _predict_rewards(self, obs_segments, act_segments, network):
+        self.model = FullyConnectedMLP(self.obs_shape, self.act_shape).to(self.device)
+        self.optimizer = optim.Adam(self.model.parameters(), lr=1e-3)
+        self.loss_fn = nn.CrossEntropyLoss()
+
+    def _predict_rewards(self, obs_segments, act_segments):
         """
-        :param obs_segments: tensor with shape = (batch_size, segment_length) + obs_shape
-        :param act_segments: tensor with shape = (batch_size, segment_length) + act_shape
-        :param network: neural net with .run() that maps obs and act tensors into a (scalar) value tensor
-        :return: tensor with shape = (batch_size, segment_length)
+        Predict rewards for segments.
+
+        Args:
+            obs_segments: tensor with shape = (batch_size, segment_length, *obs_shape)
+            act_segments: tensor with shape = (batch_size, segment_length, *act_shape)
+
+        Returns:
+            tensor with shape = (batch_size, segment_length)
         """
-        batchsize = tf.shape(obs_segments)[0]
-        segment_length = tf.shape(obs_segments)[1]
+        batch_size, segment_length = obs_segments.shape[:2]
 
-        # Temporarily chop up segments into individual observations and actions
-        obs = tf.reshape(obs_segments, (-1,) + self.obs_shape)
-        acts = tf.reshape(act_segments, (-1,) + self.act_shape)
+        # Reshape to process all timesteps at once
+        obs_flat = obs_segments.reshape(-1, *self.obs_shape)
+        acts_flat = act_segments.reshape(-1, *self.act_shape)
 
-        # Run them through our neural network
-        rewards = network.run(obs, acts)
+        # Run through the network
+        rewards = self.model(obs_flat, acts_flat)
 
-        # Group the rewards back into their segments
-        return tf.reshape(rewards, (batchsize, segment_length))
-
-    def _build_model(self):
-        """
-        Our model takes in path segments with states and actions, and generates Q values.
-        These Q values serve as predictions of the true reward.
-        We can compare two segments and sum the Q values to get a prediction of a label
-        of which segment is better. We then learn the weights for our model by comparing
-        these labels with an authority (either a human or synthetic labeler).
-        """
-        # Set up observation placeholders
-        self.segment_obs_placeholder = tf.placeholder(
-            dtype=tf.float32, shape=(None, None) + self.obs_shape, name="obs_placeholder")
-        self.segment_alt_obs_placeholder = tf.placeholder(
-            dtype=tf.float32, shape=(None, None) + self.obs_shape, name="alt_obs_placeholder")
-
-        self.segment_act_placeholder = tf.placeholder(
-            dtype=tf.float32, shape=(None, None) + self.act_shape, name="act_placeholder")
-        self.segment_alt_act_placeholder = tf.placeholder(
-            dtype=tf.float32, shape=(None, None) + self.act_shape, name="alt_act_placeholder")
-
-
-        # A vanilla multi-layer perceptron maps a (state, action) pair to a reward (Q-value)
-        mlp = FullyConnectedMLP(self.obs_shape, self.act_shape)
-
-        self.q_value = self._predict_rewards(self.segment_obs_placeholder, self.segment_act_placeholder, mlp)
-        alt_q_value = self._predict_rewards(self.segment_alt_obs_placeholder, self.segment_alt_act_placeholder, mlp)
-
-        # We use trajectory segments rather than individual (state, action) pairs because
-        # video clips of segments are easier for humans to evaluate
-        segment_reward_pred_left = tf.reduce_sum(self.q_value, axis=1)
-        segment_reward_pred_right = tf.reduce_sum(alt_q_value, axis=1)
-        reward_logits = tf.stack([segment_reward_pred_left, segment_reward_pred_right], axis=1)  # (batch_size, 2)
-
-        self.labels = tf.placeholder(dtype=tf.int32, shape=(None,), name="comparison_labels")
-
-        # delta = 1e-5
-        # clipped_comparison_labels = tf.clip_by_value(self.comparison_labels, delta, 1.0-delta)
-
-        data_loss = tf.nn.sparse_softmax_cross_entropy_with_logits(logits=reward_logits, labels=self.labels)
-
-        self.loss_op = tf.reduce_mean(data_loss)
-
-        global_step = tf.Variable(0, name='global_step', trainable=False)
-        self.train_op = tf.train.AdamOptimizer().minimize(self.loss_op, global_step=global_step)
-
-        return tf.get_default_graph()
+        # Reshape back
+        return rewards.reshape(batch_size, segment_length)
 
     def predict_reward(self, path):
-        """Predict the reward for each step in a given path"""
-        with self.graph.as_default():
-            q_value = self.sess.run(self.q_value, feed_dict={
-                self.segment_obs_placeholder: np.asarray([path["obs"]]),
-                self.segment_act_placeholder: np.asarray([path["actions"]]),
-                K.learning_phase(): False
-            })
-        return q_value[0]
+        """Predict the reward for each step in a given path."""
+        self.model.eval()
+        with torch.no_grad():
+            obs = torch.FloatTensor(np.asarray([path["obs"]])).to(self.device)
+            acts = torch.FloatTensor(np.asarray([path["actions"]])).to(self.device)
+            q_value = self._predict_rewards(obs, acts)
+        return q_value[0].cpu().numpy()
 
     def path_callback(self, path):
+        """Called after each episode path."""
         path_length = len(path["obs"])
         self._steps_since_last_training += path_length
 
         self.agent_logger.log_episode(path)
 
-        # We may be in a new part of the environment, so we take new segments to build comparisons from
+        # Sample segments from the path for future comparisons
         segment = sample_segment_from_path(path, int(self._frames_per_segment))
         if segment:
             self.recent_segments.append(segment)
 
-        # If we need more comparisons, then we build them from our recent segments
+        # If we need more comparisons, build them from recent segments
         if len(self.comparison_collector) < int(self.label_schedule.n_desired_labels):
-            self.comparison_collector.add_segment_pair(
-                random.choice(self.recent_segments),
-                random.choice(self.recent_segments))
+            if len(self.recent_segments) >= 2:
+                self.comparison_collector.add_segment_pair(
+                    random.choice(self.recent_segments),
+                    random.choice(self.recent_segments),
+                )
 
-        # Train our predictor every X steps
+        # Train predictor periodically
         if self._steps_since_last_training >= int(self._n_timesteps_per_predictor_training):
             self.train_predictor()
-            self._steps_since_last_training -= self._steps_since_last_training
+            self._steps_since_last_training = 0
 
     def train_predictor(self):
+        """Train the reward predictor on labeled comparisons."""
         self.comparison_collector.label_unlabeled_comparisons()
 
-        minibatch_size = min(64, len(self.comparison_collector.labeled_decisive_comparisons))
-        labeled_comparisons = random.sample(self.comparison_collector.labeled_decisive_comparisons, minibatch_size)
-        left_obs = np.asarray([comp['left']['obs'] for comp in labeled_comparisons])
-        left_acts = np.asarray([comp['left']['actions'] for comp in labeled_comparisons])
-        right_obs = np.asarray([comp['right']['obs'] for comp in labeled_comparisons])
-        right_acts = np.asarray([comp['right']['actions'] for comp in labeled_comparisons])
-        labels = np.asarray([comp['label'] for comp in labeled_comparisons])
+        if len(self.comparison_collector.labeled_decisive_comparisons) == 0:
+            return
 
-        with self.graph.as_default():
-            _, loss = self.sess.run([self.train_op, self.loss_op], feed_dict={
-                self.segment_obs_placeholder: left_obs,
-                self.segment_act_placeholder: left_acts,
-                self.segment_alt_obs_placeholder: right_obs,
-                self.segment_alt_act_placeholder: right_acts,
-                self.labels: labels,
-                K.learning_phase(): True
-            })
-            self._elapsed_predictor_training_iters += 1
-            self._write_training_summaries(loss)
+        minibatch_size = min(64, len(self.comparison_collector.labeled_decisive_comparisons))
+        labeled_comparisons = random.sample(
+            self.comparison_collector.labeled_decisive_comparisons, minibatch_size
+        )
+
+        # Prepare batch data
+        left_obs = torch.FloatTensor(
+            np.asarray([comp["left"]["obs"] for comp in labeled_comparisons])
+        ).to(self.device)
+        left_acts = torch.FloatTensor(
+            np.asarray([comp["left"]["actions"] for comp in labeled_comparisons])
+        ).to(self.device)
+        right_obs = torch.FloatTensor(
+            np.asarray([comp["right"]["obs"] for comp in labeled_comparisons])
+        ).to(self.device)
+        right_acts = torch.FloatTensor(
+            np.asarray([comp["right"]["actions"] for comp in labeled_comparisons])
+        ).to(self.device)
+        labels = torch.LongTensor(
+            np.asarray([comp["label"] for comp in labeled_comparisons])
+        ).to(self.device)
+
+        # Training step
+        self.model.train()
+        self.optimizer.zero_grad()
+
+        # Predict rewards for both segments
+        left_rewards = self._predict_rewards(left_obs, left_acts)
+        right_rewards = self._predict_rewards(right_obs, right_acts)
+
+        # Sum rewards over segment length
+        left_sum = left_rewards.sum(dim=1)
+        right_sum = right_rewards.sum(dim=1)
+
+        # Create logits for classification
+        logits = torch.stack([left_sum, right_sum], dim=1)
+
+        # Compute loss
+        loss = self.loss_fn(logits, labels)
+        loss.backward()
+        self.optimizer.step()
+
+        self._elapsed_predictor_training_iters += 1
+        self._write_training_summaries(loss.item())
 
     def _write_training_summaries(self, loss):
+        """Write training summaries to TensorBoard."""
         self.agent_logger.log_simple("predictor/loss", loss)
 
-        # Calculate correlation between true and predicted reward by running validation on recent episodes
+        # Calculate correlation between true and predicted reward
         recent_paths = self.agent_logger.get_recent_paths_with_padding()
-        if len(recent_paths) > 1 and self.agent_logger.summary_step % 10 == 0:  # Run validation every 10 iters
-            validation_obs = np.asarray([path["obs"] for path in recent_paths])
-            validation_acts = np.asarray([path["actions"] for path in recent_paths])
-            q_value = self.sess.run(self.q_value, feed_dict={
-                self.segment_obs_placeholder: validation_obs,
-                self.segment_act_placeholder: validation_acts,
-                K.learning_phase(): False
-            })
-            ep_reward_pred = np.sum(q_value, axis=1)
-            reward_true = np.asarray([path['original_rewards'] for path in recent_paths])
+        if len(recent_paths) > 1 and self.agent_logger.summary_step % 10 == 0:
+            self.model.eval()
+            with torch.no_grad():
+                validation_obs = torch.FloatTensor(
+                    np.asarray([path["obs"] for path in recent_paths])
+                ).to(self.device)
+                validation_acts = torch.FloatTensor(
+                    np.asarray([path["actions"] for path in recent_paths])
+                ).to(self.device)
+                q_value = self._predict_rewards(validation_obs, validation_acts)
+
+            ep_reward_pred = q_value.sum(dim=1).cpu().numpy()
+            reward_true = np.asarray([path["original_rewards"] for path in recent_paths])
             ep_reward_true = np.sum(reward_true, axis=1)
             self.agent_logger.log_simple("predictor/correlations", corrcoef(ep_reward_true, ep_reward_pred))
 
@@ -206,25 +207,164 @@ class ComparisonRewardPredictor():
         self.agent_logger.log_simple("labels/desired_labels", self.label_schedule.n_desired_labels)
         self.agent_logger.log_simple("labels/total_comparisons", len(self.comparison_collector))
         self.agent_logger.log_simple(
-            "labels/labeled_comparisons", len(self.comparison_collector.labeled_decisive_comparisons))
+            "labels/labeled_comparisons", len(self.comparison_collector.labeled_decisive_comparisons)
+        )
+
+
+class RewardPredictorWrapper(gym.Wrapper):
+    """Gymnasium wrapper that replaces the environment reward with predicted reward."""
+
+    def __init__(self, env, predictor):
+        super().__init__(env)
+        self.predictor = predictor
+        self._current_path = None
+        self._reset_path()
+
+    def _reset_path(self):
+        self._current_path = {
+            "obs": [],
+            "actions": [],
+            "original_rewards": [],
+            "human_obs": [],
+        }
+
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        self._reset_path()
+        return obs, info
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+
+        # Store step data
+        self._current_path["obs"].append(obs)
+        self._current_path["actions"].append(action)
+        self._current_path["original_rewards"].append(reward)
+        self._current_path["human_obs"].append(info.get("human_obs"))
+
+        # On episode end, compute predicted rewards and call callback
+        if terminated or truncated:
+            path = {k: np.array(v) for k, v in self._current_path.items()}
+            predicted_rewards = self.predictor.predict_reward(path)
+            self.predictor.path_callback(path)
+
+            # Return the last predicted reward
+            if len(predicted_rewards) > 0:
+                reward = predicted_rewards[-1]
+
+            self._reset_path()
+
+        return obs, reward, terminated, truncated, info
+
+
+class RewardPredictorCallback(BaseCallback):
+    """Stable-Baselines3 callback for integrating with the reward predictor."""
+
+    def __init__(self, predictor, verbose=0):
+        super().__init__(verbose)
+        self.predictor = predictor
+
+    def _on_step(self):
+        return True
+
+
+def make_env_fn(env_id, make_env_func, seed=0):
+    """Create a function that makes an environment (without predictor wrapper)."""
+    def _init():
+        env = make_env_func(env_id)
+        env.reset(seed=seed)
+        return env
+    return _init
+
+
+def train_with_ppo(
+    env_id,
+    make_env,
+    predictor,
+    summary_writer,
+    num_timesteps,
+    seed=1,
+    workers=4,
+    use_predicted_reward=False,
+):
+    """Train an agent using PPO from Stable-Baselines3."""
+    print(f"Training with PPO for {num_timesteps} timesteps...")
+
+    if use_predicted_reward:
+        # For learned reward, use DummyVecEnv with reward wrapper (can't pickle predictor)
+        def make_wrapped_env():
+            env = make_env(env_id)
+            env.reset(seed=seed)
+            return RewardPredictorWrapper(env, predictor)
+
+        env = DummyVecEnv([make_wrapped_env])
+        print("Using single environment with reward predictor (DummyVecEnv)")
+    else:
+        # For baseline RL, can use SubprocVecEnv for parallelism
+        if workers > 1:
+            env = SubprocVecEnv([
+                make_env_fn(env_id, make_env, seed + i) for i in range(workers)
+            ])
+            print(f"Using {workers} parallel environments (SubprocVecEnv)")
+        else:
+            env = DummyVecEnv([make_env_fn(env_id, make_env, seed)])
+
+    # Create PPO model
+    model = PPO(
+        "MlpPolicy",
+        env,
+        verbose=1,
+        learning_rate=3e-4,
+        n_steps=2048,
+        batch_size=64,
+        n_epochs=10,
+        gamma=0.99,
+        gae_lambda=0.95,
+        clip_range=0.2,
+        ent_coef=0.0,
+        tensorboard_log=osp.expanduser("~/tb/rl-teacher/"),
+        seed=seed,
+    )
+
+    # Create callback
+    callback = RewardPredictorCallback(predictor) if predictor else None
+
+    # Train
+    model.learn(total_timesteps=num_timesteps, callback=callback)
+
+    # Save the model
+    save_path = osp.expanduser(f"~/tb/rl-teacher/models/{env_id}_{num_timesteps}.zip")
+    os.makedirs(osp.dirname(save_path), exist_ok=True)
+    model.save(save_path)
+    print(f"Model saved to: {save_path}")
+
+    env.close()
+    return model
+
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument('-e', '--env_id', required=True)
-    parser.add_argument('-p', '--predictor', required=True)
-    parser.add_argument('-n', '--name', required=True)
-    parser.add_argument('-s', '--seed', default=1, type=int)
-    parser.add_argument('-w', '--workers', default=4, type=int)
-    parser.add_argument('-l', '--n_labels', default=None, type=int)
-    parser.add_argument('-L', '--pretrain_labels', default=None, type=int)
-    parser.add_argument('-t', '--num_timesteps', default=5e6, type=int)
-    parser.add_argument('-a', '--agent', default="parallel_trpo", type=str)
-    parser.add_argument('-i', '--pretrain_iters', default=10000, type=int)
-    parser.add_argument('-V', '--no_videos', action="store_true")
+
+    parser = argparse.ArgumentParser(description="RL-Teacher: Deep RL from Human Preferences")
+    parser.add_argument("-e", "--env_id", required=True, help="Environment ID (e.g., Hopper-v5)")
+    parser.add_argument("-p", "--predictor", required=True, choices=["rl", "synth", "human"],
+                        help="Predictor type: rl (true reward), synth (synthetic labels), human (human labels)")
+    parser.add_argument("-n", "--name", required=True, help="Experiment name")
+    parser.add_argument("-s", "--seed", default=1, type=int, help="Random seed")
+    parser.add_argument("-w", "--workers", default=4, type=int, help="Number of parallel workers")
+    parser.add_argument("-l", "--n_labels", default=None, type=int, help="Total number of labels to collect")
+    parser.add_argument("-L", "--pretrain_labels", default=None, type=int, help="Number of pretraining labels")
+    parser.add_argument("-t", "--num_timesteps", default=5e6, type=int, help="Total training timesteps")
+    parser.add_argument("-i", "--pretrain_iters", default=10000, type=int, help="Predictor pretraining iterations")
+    parser.add_argument("-V", "--no_videos", action="store_true", help="Disable video recording")
     args = parser.parse_args()
 
     print("Setting things up...")
+
+    # Set random seeds
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    random.seed(args.seed)
 
     env_id = args.env_id
     run_name = "%s/%s-%s" % (env_id, args.name, int(time()))
@@ -240,23 +380,23 @@ def main():
     else:
         agent_logger = AgentLogger(summary_writer)
 
-        pretrain_labels = args.pretrain_labels if args.pretrain_labels else args.n_labels // 4
+        pretrain_labels = args.pretrain_labels if args.pretrain_labels else (args.n_labels // 4 if args.n_labels else 50)
 
         if args.n_labels:
             label_schedule = LabelAnnealer(
                 agent_logger,
                 final_timesteps=num_timesteps,
                 final_labels=args.n_labels,
-                pretrain_labels=pretrain_labels)
+                pretrain_labels=pretrain_labels,
+            )
         else:
             print("No label limit given. We will request one label every few seconds.")
             label_schedule = ConstantLabelSchedule(pretrain_labels=pretrain_labels)
 
         if args.predictor == "synth":
             comparison_collector = SyntheticComparisonCollector()
-
         elif args.predictor == "human":
-            bucket = os.environ.get('RL_TEACHER_GCS_BUCKET')
+            bucket = os.environ.get("RL_TEACHER_GCS_BUCKET")
             assert bucket and bucket.startswith("gs://"), "env variable RL_TEACHER_GCS_BUCKET must start with gs://"
             comparison_collector = HumanComparisonCollector(env_id, experiment_name=experiment_name)
         else:
@@ -272,54 +412,56 @@ def main():
 
         print("Starting random rollouts to generate pretraining segments. No learning will take place...")
         pretrain_segments = segments_from_rand_rollout(
-            env_id, make_with_torque_removed, n_desired_segments=pretrain_labels * 2,
-            clip_length_in_seconds=CLIP_LENGTH, workers=args.workers)
-        for i in range(pretrain_labels):  # Turn our random segments into comparisons
-            comparison_collector.add_segment_pair(pretrain_segments[i], pretrain_segments[i + pretrain_labels])
+            env_id,
+            make_with_torque_removed,
+            n_desired_segments=pretrain_labels * 2,
+            clip_length_in_seconds=CLIP_LENGTH,
+            workers=args.workers,
+        )
 
-        # Sleep until the human has labeled most of the pretraining comparisons
+        for i in range(pretrain_labels):
+            comparison_collector.add_segment_pair(
+                pretrain_segments[i], pretrain_segments[i + pretrain_labels]
+            )
+
+        # Wait for labels
         while len(comparison_collector.labeled_comparisons) < int(pretrain_labels * 0.75):
             comparison_collector.label_unlabeled_comparisons()
             if args.predictor == "synth":
-                print("%s synthetic labels generated... " % (len(comparison_collector.labeled_comparisons)))
+                print("%s synthetic labels generated... " % len(comparison_collector.labeled_comparisons))
             elif args.predictor == "human":
-                print("%s/%s comparisons labeled. Please add labels w/ the human-feedback-api. Sleeping... " % (
-                    len(comparison_collector.labeled_comparisons), pretrain_labels))
+                print(
+                    "%s/%s comparisons labeled. Please add labels w/ the human-feedback-api. Sleeping... "
+                    % (len(comparison_collector.labeled_comparisons), pretrain_labels)
+                )
                 sleep(5)
 
-        # Start the actual training
+        # Pretrain the predictor
         for i in range(args.pretrain_iters):
-            predictor.train_predictor()  # Train on pretraining labels
+            predictor.train_predictor()
             if i % 100 == 0:
                 print("%s/%s predictor pretraining iters... " % (i, args.pretrain_iters))
 
-    # Wrap the predictor to capture videos every so often:
-    if not args.no_videos:
-        predictor = SegmentVideoRecorder(predictor, env, save_dir=osp.join('/tmp/rl_teacher_vids', run_name))
-
-    # We use a vanilla agent from openai/baselines that contains a single change that blinds it to the true reward
-    # The single changed section is in `rl_teacher/agent/trpo/core.py`
-    print("Starting joint training of predictor and agent")
-    if args.agent == "parallel_trpo":
-        train_parallel_trpo(
-            env_id=env_id,
-            make_env=make_with_torque_removed,
-            predictor=predictor,
-            summary_writer=summary_writer,
-            workers=args.workers,
-            runtime=(num_timesteps / 1000),
-            max_timesteps_per_episode=get_timesteps_per_episode(env),
-            timesteps_per_batch=8000,
-            max_kl=0.001,
-            seed=args.seed,
+    # Wrap the predictor to capture videos
+    if not args.no_videos and args.predictor != "rl":
+        predictor = SegmentVideoRecorder(
+            predictor, env, save_dir=osp.join("/tmp/rl_teacher_vids", run_name)
         )
-    elif args.agent == "pposgd_mpi":
-        def make_env():
-            return make_with_torque_removed(env_id)
 
-        train_pposgd_mpi(make_env, num_timesteps=num_timesteps, seed=args.seed, predictor=predictor)
-    else:
-        raise ValueError("%s is not a valid choice for args.agent" % args.agent)
+    # Train with PPO
+    print("Starting joint training of predictor and agent")
+    use_predicted_reward = args.predictor != "rl"
+    train_with_ppo(
+        env_id=env_id,
+        make_env=make_with_torque_removed,
+        predictor=predictor if use_predicted_reward else None,
+        summary_writer=summary_writer,
+        num_timesteps=num_timesteps,
+        seed=args.seed,
+        workers=args.workers,
+        use_predicted_reward=use_predicted_reward,
+    )
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()

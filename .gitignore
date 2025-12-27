@@ -2,6 +2,20 @@
 
 *.sqlite3
 
+# TensorBoard logs and models
+tb/
+~/tb/
+*.zip
+
+# Temporary files
+/tmp/
+*.mp4
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
 ### Python template
 # Byte-compiled / optimized / DLL files
 __pycache__/
