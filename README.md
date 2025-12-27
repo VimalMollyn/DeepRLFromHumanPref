@@ -1,5 +1,7 @@
 # RL-Teacher
 
+> **Warning**: This code was automatically converted to modern libraries using Claude Code and is NOT fully tested. Use at your own risk!
+
 `rl-teacher` is an implementation of [*Deep Reinforcement Learning from Human Preferences*](https://arxiv.org/abs/1706.03741) [Christiano et al., 2017].
 
 **Updated for 2025** with modern libraries:
